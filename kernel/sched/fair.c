@@ -4242,8 +4242,89 @@ static inline int util_fits_cpu(unsigned long util,
 	 */
 	fits = fits_capacity(util, capacity);
 
-	if (!uclamp_is_used())
-		return fits;
+	return capacity * 1024 > uclamp_task_util(p) * margin;
+}
+
+static inline bool task_fits_max(struct task_struct *p, int cpu)
+{
+	unsigned long capacity = capacity_orig_of(cpu);
+	unsigned long max_capacity = cpu_rq(cpu)->rd->max_cpu_capacity.val;
+	unsigned long task_boost = per_task_boost(p);
+
+	if (capacity == max_capacity)
+		return true;
+
+	if (is_min_capacity_cpu(cpu)) {
+		if (task_boost_policy(p) == SCHED_BOOST_ON_BIG ||
+			task_boost > 0 ||
+			schedtune_task_boost(p) > 0 ||
+			walt_should_kick_upmigrate(p, cpu))
+			return false;
+	} else { /* mid cap cpu */
+		if (task_boost > TASK_BOOST_ON_MID)
+			return false;
+	}
+
+	return task_fits_capacity(p, capacity, cpu);
+}
+
+static inline bool task_demand_fits(struct task_struct *p, int cpu)
+{
+	unsigned long capacity = capacity_orig_of(cpu);
+	unsigned long max_capacity = cpu_rq(cpu)->rd->max_cpu_capacity.val;
+
+	if (capacity == max_capacity)
+		return true;
+
+	return task_fits_capacity(p, capacity, cpu);
+}
+
+struct find_best_target_env {
+	int placement_boost;
+	int need_idle;
+	int fastpath;
+	int start_cpu;
+	int skip_cpu;
+	bool is_rtg;
+	bool boosted;
+	bool strict_max;
+};
+
+static inline void adjust_cpus_for_packing(struct task_struct *p,
+			int *target_cpu, int *best_idle_cpu,
+			int shallowest_idle_cstate,
+			struct find_best_target_env *fbt_env,
+			bool boosted)
+{
+	unsigned long tutil, estimated_capacity;
+
+	if (*best_idle_cpu == -1 || *target_cpu == -1)
+		return;
+
+#ifdef CONFIG_SCHED_WALT
+	if (prefer_spread_on_idle(*best_idle_cpu, false))
+		fbt_env->need_idle |= 2;
+#endif 
+
+	if (task_rtg_high_prio(p) && walt_nr_rtg_high_prio(*target_cpu) > 0) {
+		*target_cpu = -1;
+		return;
+	}
+
+	if (fbt_env->need_idle || task_placement_boost_enabled(p) || boosted ||
+		shallowest_idle_cstate <= 0) {
+		*target_cpu = -1;
+		return;
+	}
+
+	if (task_in_cum_window_demand(cpu_rq(*target_cpu), p))
+		tutil = 0;
+	else
+		tutil = task_util(p);
+
+	estimated_capacity = cpu_util_cum(*target_cpu, tutil);
+	estimated_capacity = add_capacity_margin(estimated_capacity,
+							*target_cpu);
 
 	/*
 	 * We must use capacity_orig_of() for comparing against uclamp_min and
@@ -10285,6 +10366,14 @@ static int load_balance(int this_cpu, struct rq *this_rq,
 		.tasks		= LIST_HEAD_INIT(env.tasks),
 	};
 
+#ifdef CONFIG_SCHED_WALT
+	env.prefer_spread = (idle != CPU_NOT_IDLE &&
+				prefer_spread_on_idle(this_cpu,
+				idle == CPU_NEWLY_IDLE) &&
+				!((sd->flags & SD_ASYM_CPUCAPACITY) &&
+				 !is_asym_cap_cpu(this_cpu)));
+#endif
+
 	cpumask_and(cpus, sched_domain_span(sd), cpu_active_mask);
 
 	schedstat_inc(sd->lb_count[idle]);
@@ -10700,6 +10789,15 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
 		}
 		max_cost += sd->max_newidle_lb_cost;
 
+#ifdef CONFIG_SCHED_WALT
+		if (!sd_overutilized(sd) && !prefer_spread_on_idle(cpu,
+					idle == CPU_NEWLY_IDLE))
+			continue;
+#endif
+
+		if (!(sd->flags & SD_LOAD_BALANCE))
+			continue;
+
 		/*
 		 * Stop the load balance at this level. There is another
 		 * CPU in our sched group which is doing load balancing more
@@ -10870,9 +10968,19 @@ static void nohz_balancer_kick(struct rq *rq)
 	if (time_before(now, nohz.next_balance))
 		goto out;
 
-	trace_android_rvh_sched_nohz_balancer_kick(rq, &flags, &done);
-	if (done)
+#ifdef CONFIG_SCHED_WALT
+	/*
+	 * With EAS, no-hz idle balance is allowed only when the CPU
+	 * is overutilized and has 2 tasks. The misfit task migration
+	 * happens from the tickpath.
+	 */
+	if (static_branch_likely(&sched_energy_present)) {
+		if (rq->nr_running >= 2 && (cpu_overutilized(cpu) ||
+			prefer_spread_on_idle(cpu, false)))
+			flags = NOHZ_KICK_MASK;
 		goto out;
+	}
+#endif
 
 	if (rq->nr_running >= 2) {
 		flags = NOHZ_KICK_MASK;
@@ -11266,7 +11374,14 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	struct sched_domain *sd;
 	int pulled_task = 0;
 	u64 curr_cost = 0;
-	int done = 0;
+	u64 avg_idle = this_rq->avg_idle;
+#ifdef CONFIG_SCHED_WALT
+	bool prefer_spread = prefer_spread_on_idle(this_cpu, true);
+#endif
+	bool force_lb = (!is_min_capacity_cpu(this_cpu) &&
+				silver_has_big_tasks() &&
+				sysctl_sched_force_lb_enable &&
+				(atomic_read(&this_rq->nr_iowait) == 0));
 
 	trace_android_rvh_sched_newidle_balance(this_rq, rf, &pulled_task, &done);
 	if (done)
@@ -11293,6 +11408,10 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 	if (!cpu_active(this_cpu))
 		return 0;
 
+#ifdef CONFIG_SCHED_WALT
+	if (force_lb || prefer_spread)
+		avg_idle = ULLONG_MAX;
+#endif
 	/*
 	 * This is OK, because current is on_cpu, which avoids it being picked
 	 * for load-balance and preemption/IRQs are still disabled avoiding
@@ -11321,7 +11440,16 @@ static int newidle_balance(struct rq *this_rq, struct rq_flags *rf)
 		int continue_balancing = 1;
 		u64 t0, domain_cost;
 
-		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost) {
+		if (!(sd->flags & SD_LOAD_BALANCE))
+			continue;
+
+#ifdef CONFIG_SCHED_WALT
+		if (prefer_spread && !force_lb &&
+			(sd->flags & SD_ASYM_CPUCAPACITY) &&
+			!is_asym_cap_cpu(this_cpu))
+			avg_idle = this_rq->avg_idle;
+#endif
+		if (avg_idle < curr_cost + sd->max_newidle_lb_cost) {
 			update_next_balance(sd, &next_balance);
 			break;
 		}
