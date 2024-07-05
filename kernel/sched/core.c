@@ -5584,24 +5584,7 @@ void scheduler_tick(void)
 	trigger_load_balance(rq);
 #endif
 
-	rcu_read_lock();
-	grp = task_related_thread_group(curr);
-	if (update_preferred_cluster(grp, curr, old_load, true))
-		set_preferred_cluster(grp);
-	rcu_read_unlock();
-
-#ifdef CONFIG_SCHED_WALT
-	if (curr->sched_class == &fair_sched_class)
-		check_for_migration(rq, curr);
-#endif
-
-#ifdef CONFIG_SMP
-	rq_lock(rq, &rf);
-	if (idle_cpu(cpu) && is_reserved(cpu) && !rq->active_balance)
-		clear_reserved(cpu);
-	rq_unlock(rq, &rf);
-#endif
-
+	trace_android_vh_scheduler_tick(rq);
 }
 
 #ifdef CONFIG_NO_HZ_FULL
