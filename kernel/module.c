@@ -3591,12 +3591,6 @@ static char *custom_module_blacklist[] = {
 #if IS_BUILTIN(CONFIG_ZSMALLOC)
     "zsmalloc",
 #endif
-#if IS_BUILTIN(CONFIG_I2C_MSM_GENI)
-    "i2c-msm-geni",
-#endif
-#if IS_ENABLED(CONFIG_NOPMI_CHARGER)
-    "nopmi-chg",
-#endif
 #ifdef CONFIG_MACH_XIAOMI_TOPAZ
     /* Useless logs */
     "f_fs_ipc_log",
